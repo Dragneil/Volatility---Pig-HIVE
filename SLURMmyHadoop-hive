@@ -1,0 +1,149 @@
+#!/bin/bash
+#SBATCH --partition=debug
+#SBATCH --time=00:20:00
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=22
+#SBATCH --exclusive
+#SBATCH --job-name="test_hive"
+#SBATCH --output=test-%J.out
+#SBATCH --mail-user=kchavali@buffalo.edu
+#Specifies that the job will be requeued after a node failure.
+#The default is that the job will not be requeued.
+#
+#This SLURM script is modified version of the SDSC script
+# found in /util/academic/myhadoop/myHadoop-0.30b/examples.
+# CDC January 29, 2015
+#
+echo "SLURM_JOBID="$SLURM_JOBID
+echo "SLURM_JOB_NODELIST"=$SLURM_JOB_NODELIST
+echo "SLURM_NNODES"=$SLURM_NNODES
+echo "SLURMTMPDIR="$SLURMTMPDIR
+
+echo "working directory = "$SLURM_SUBMIT_DIR
+
+module load java/1.6.0_22
+module load hadoop/2.5.1
+module load hive/0.14.0
+module load myhadoop/0.30b
+module list
+echo "MH_HOME="$MH_HOME
+echo "HADOOP_HOME="$HADOOP_HOME
+echo "Setting HADOOP to use SLURMTMPDIR on the local disk"
+export MH_SCRATCH_DIR=$SLURMTMPDIR
+echo "MH_SCRATCH_DIR="$MH_SCRATCH_DIR
+#### Set this to the directory where Hadoop configs should be generated
+# Don't change the name of this variable (HADOOP_CONF_DIR) as it is
+# required by Hadoop - all config files will be picked up from here
+#
+# Make sure that this is accessible to all nodes
+export HADOOP_CONF_DIR=$SLURM_SUBMIT_DIR/config-$SLURM_JOBID
+export HIVE_CONF_DIR=$SLURM_SUBMIT_DIR/config-$SLURM_JOBID
+echo "create diretory for HIVE metadata"
+### Set up the configuration
+# Make sure number of nodes is the same as what you have requested from PBS
+# usage: $myhadoop-configure.sh -h
+# this is the non-persistent mode
+NPROCS=`srun --nodes=${SLURM_NNODES} bash -c 'hostname' |wc -l`
+echo "-------Set up the configurations for myHadoop"
+$MH_HOME/bin/myhadoop-configure.sh 
+#
+cp $HIVE_HOME/conf/hive-env.sh-sample $HIVE_CONF_DIR/hive-env.sh
+cp $HIVE_HOME/conf/hive-default.xml-sample $HIVE_CONF_DIR/hive-default.xml
+sed -i 's:MY_HIVE_SCRATCH:'"$SLURMTMPDIR"':g' $HIVE_CONF_DIR/hive-default.xml
+cp $HIVE_HOME/conf/hive-log4j.properties-sample $HIVE_CONF_DIR/hive-log4j.properties
+sed -i 's:MY_HIVE_DIR:'"$SLURM_SUBMIT_DIR"':' $HIVE_CONF_DIR/hive-log4j.properties
+ls -l $HADOOP_CONF_DIR
+echo "-------Start hdfs and yarn ---"
+$HADOOP_HOME/sbin/start-all.sh
+#### Format HDFS, if this is the first time or not a persistent instance
+echo "-------Show Report ---"
+#$HADOOP_HOME/bin/hadoop dfsadmin -report
+echo "-------make directory ---"
+$HADOOP_HOME/bin/hdfs --config $HADOOP_CONF_DIR dfs -mkdir /tmp
+$HADOOP_HOME/bin/hdfs --config $HADOOP_CONF_DIR dfs -mkdir -p /user/hive/warehouse
+$HADOOP_HOME/bin/hdfs --config $HADOOP_CONF_DIR dfs -chmod g+w /tmp
+$HADOOP_HOME/bin/hdfs --config $HADOOP_CONF_DIR dfs -chmod g+w /user/hive/warehouse
+echo "-------list warehouse directory ---"
+$HADOOP_HOME/bin/hdfs --config $HADOOP_CONF_DIR dfs -ls /user/hive/warehouse
+timestamp1=$(date +"%s")
+echo "Drop tables if they exist"
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS files"
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS stock"
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS temp"
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS xiTable"
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS count"
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS meanTable"
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS variance"
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS sumvar"
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS volatility"
+
+echo "Create Table files"
+$HIVE_HOME/bin/hive -e "CREATE TABLE files(Date String, Open Double,High Double, Low Double, Close Double, Volume Double, AdjClose Double) ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' TBLPROPERTIES('skip.header.line.count'='1');"
+
+echo "Load data"
+$HIVE_HOME/bin/hive -e "LOAD DATA LOCAL INPATH '$1/*.csv' INTO TABLE files;;"
+
+$HIVE_HOME/bin/hive -e "CREATE TABLE stock(Filename String, year int, month int, day int, AdjClose Double);"
+
+echo "load stock"
+$HIVE_HOME/bin/hive -e "INSERT INTO TABLE stock SELECT regexp_extract(INPUT__FILE__NAME,'[^/]+$',0) as filename,split(Date,'-')[0] as year,split(Date,'-')[1] as month, split(Date,'-')[2] as day, AdjClose as ac FROM files;"
+$HIVE_HOME/bin/hive -e "drop table files;"
+
+echo "create temp"
+$HIVE_HOME/bin/hive -e "create table temp(Filename String, year int, month int, day int, adjclose Double);"
+
+echo "load temp"
+$HIVE_HOME/bin/hive -e "INSERT INTO TABLE temp select s.filename as filename, s.year as year, s.month as month, s.day as day, s.adjclose FROM stock as s, (SELECT filename,year,month, max(day) as day1, min(day) as day2 FROM stock GROUP BY filename,year,month) as min WHERE s.filename = min.filename AND min.year = s.year AND min.month = s.month AND (min.day1 = s.day OR min.day2 = s.day);"
+$HIVE_HOME/bin/hive -e "drop table stock;"
+
+echo "create xiTable"
+$HIVE_HOME/bin/hive -e "create table xiTable(Filename String, year int, month int, xi Double);"
+
+echo " load xiTable"
+$HIVE_HOME/bin/hive -e "INSERT INTO TABLE xiTable select s.filename as filename, s.year as year, s.month as month,(x.adjclose - s.adjclose)/s.adjclose FROM temp as s, temp as x WHERE s.filename = x.filename AND x.year = s.year AND x.month = s.month AND x.day > s.day;"
+$HIVE_HOME/bin/hive -e "drop table temp;"
+
+echo " create mean "
+$HIVE_HOME/bin/hive -e "create table meanTable(filename String, mean Double);"
+
+echo " load mean "
+$HIVE_HOME/bin/hive -e "INSERT INTO TABLE meanTable select filename, avg(xi) as mean from xiTable group by filename;"
+
+echo "create and load count"
+$HIVE_HOME/bin/hive -e "create table count(filename String, count Double);"
+$HIVE_HOME/bin/hive -e "INSERT INTO TABLE count select filename, count(xi) as N from xiTable group by filename;"
+
+echo "variance"
+$HIVE_HOME/bin/hive -e "create table variance(filename String, square Double);"
+$HIVE_HOME/bin/hive -e "INSERT INTO TABLE variance select x.filename, ((x.xi - m.mean)*(x.xi - m.mean)) as square FROM meanTable as m, xiTable as x WHERE m.filename = x.filename;"
+
+echo " sum of variance"
+$HIVE_HOME/bin/hive -e "create table sumvar(filename String, var Double);"
+$HIVE_HOME/bin/hive -e "INSERT INTO TABLE sumvar select filename, sum(square) FROM variance GROUP BY filename;"
+$HIVE_HOME/bin/hive -e "drop table variance;"
+$HIVE_HOME/bin/hive -e "drop table meanTable;"
+$HIVE_HOME/bin/hive -e "drop table xiTable;"
+
+
+
+echo " calculate volatility "
+$HIVE_HOME/bin/hive -e "create table volatility(filename String, volatility Double);"
+$HIVE_HOME/bin/hive -e "INSERT INTO TABLE volatility select v.filename, sqrt(v.var/(c.count-1)) as vol FROM count as c, sumvar as v WHERE c.filename = v.filename AND c.count > 0 AND v.var > 0; "
+
+echo "Lowest stocks: "
+$HIVE_HOME/bin/hive -e "select filename, volatility from volatility order by volatility ASC LIMIT 10;"
+echo "Highest stocks: "
+$HIVE_HOME/bin/hive -e "select filename, volatility from volatility order by volatility DESC LIMIT 10;"
+
+timestamp2=$(date +"%s")
+dif=$(($timestamp2-$timestamp1))
+
+echo "ALL DONE in $dif"
+
+
+echo "-------Stop hdfs and yarn ---"
+$HADOOP_HOME/sbin/stop-all.sh
+
+#### Clean up the working directories after job completion
+$MH_HOME/bin/myhadoop-cleanup.sh
+
